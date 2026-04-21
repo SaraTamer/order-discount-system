@@ -1,6 +1,10 @@
 import scala.annotation.tailrec
 import scala.io.Source
 import scala.collection.parallel.CollectionConverters.*
+import java.util.concurrent.Executors
+import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.duration.*
+import scala.sys.exit
 
 object orderProcessing extends App {
 
@@ -17,6 +21,7 @@ object orderProcessing extends App {
     import DatabaseConfig._
     val oracleWriter = new OracleWriter(url, user, password)
     oracleWriter.createTableIfNotExists(tableName)
+    oracleWriter.truncateTable()
 
     // State as immutable case class
     case class ProcessState(
@@ -27,56 +32,85 @@ object orderProcessing extends App {
                              totalInserted: Int
                            )
 
-    @tailrec
-    def processBatches(
-                        lines: Iterator[String],
-                        batchSize: Int,
-                        state: ProcessState
-                      ): ProcessState = {
-      if (!lines.hasNext) state
-      else {
-        val batchLines = lines.take(batchSize).toList
-        if (batchLines.isEmpty) state
-        else {
-          // Parse batch in parallel
-          val orders = batchLines.par.flatMap { line =>
-            OrderParser().fromCsvLine(line).toOption
-          }.toList
+    // Increase batch size for better throughput
+    val batchSize = 50000 // 50K records per batch (adjust based on memory)
+    val parallelismLevel = Runtime.getRuntime.availableProcessors()
+    logger.info(s"Using parallelism level: $parallelismLevel")
 
-          // Process orders in parallel
-          val processedOrders = orders.par.map(orderProcessor.calculateFinalPrice).toList
+    // Create a thread pool for parallel batch processing
+    val batchParallelism = 4 // Process 4 batches concurrently
+    implicit val ec: ExecutionContext = ExecutionContext.fromExecutor(
+      Executors.newFixedThreadPool(batchParallelism)
+    )
 
-          // Calculate batch summary using parallel aggregation
-          val (batchOriginal, batchDiscount, batchFinal) = processedOrders.par.aggregate((0.0, 0.0, 0.0))(
-            { case ((orig, disc, fin), order) =>
-              (orig + order.order.unitPrice * order.order.quantity, disc + order.discountAmount, fin + order.finalPrice)
-            },
-            { case ((o1, d1, f1), (o2, d2, f2)) =>
-              (o1 + o2, d1 + d2, f1 + f2)
+    def processBatchesParallel(
+                                lines: Iterator[String],
+                                batchSize: Int,
+                                state: ProcessState
+                              ): ProcessState = {
+      @tailrec
+      def processBatchGroup(
+                             remainingLines: Iterator[String],
+                             currentState: ProcessState,
+                             batchFutures: List[Future[(List[ProcessedOrder], (Double, Double, Double))]]
+                           ): ProcessState = {
+        if (batchFutures.isEmpty && !remainingLines.hasNext) {
+          currentState
+        } else if (batchFutures.size < batchParallelism && remainingLines.hasNext) {
+          // Start new batch
+          val batchLines = remainingLines.take(batchSize).toVector
+          if (batchLines.isEmpty) {
+            processBatchGroup(remainingLines, currentState, batchFutures)
+          } else {
+            val future = Future {
+              val orders = batchLines.par.flatMap(OrderParser.fromCsvLine(_).toOption).toList
+              val processed = orders.par.map(orderProcessor.calculateFinalPrice).toList
+              val summary = processed.foldLeft((0.0, 0.0, 0.0)) {
+                case ((orig, disc, fin), order) =>
+                  (orig + order.order.unitPrice * order.order.quantity,
+                    disc + order.discountAmount,
+                    fin + order.finalPrice)
+              }
+              (processed, summary)
             }
-          )
-
-          // Insert batch
-          val insertedCount = if (processedOrders.nonEmpty) {
-            oracleWriter.insertNewOrdersOnly(processedOrders, tableName)
-          } else 0
-
-          logger.info(s"Processed batch: ${processedOrders.length} orders, Inserted: $insertedCount")
-
-          // Recursively process next batch
-          processBatches(lines, batchSize, ProcessState(
-            processedCount = state.processedCount + processedOrders.length,
-            totalOriginal = state.totalOriginal + batchOriginal,
-            totalDiscount = state.totalDiscount + batchDiscount,
-            totalFinal = state.totalFinal + batchFinal,
-            totalInserted = state.totalInserted + insertedCount
-          ))
+            processBatchGroup(remainingLines, currentState, future :: batchFutures)
+          }
+        } else {
+          // Wait for completed futures
+          val (completed, remaining) = batchFutures.partition(_.isCompleted)
+          if (completed.nonEmpty) {
+            val results = completed.map(Await.result(_, 1.minute))
+            val newState = results.foldLeft(currentState) {
+              case (state, (processed, (orig, disc, fin))) =>
+                val inserted = oracleWriter.insertOrders(processed, tableName)
+                logger.info(s"Processed batch: ${processed.length} orders, Inserted: $inserted")
+                ProcessState(
+                  processedCount = state.processedCount + processed.length,
+                  totalOriginal = state.totalOriginal + orig,
+                  totalDiscount = state.totalDiscount + disc,
+                  totalFinal = state.totalFinal + fin,
+                  totalInserted = state.totalInserted + inserted
+                )
+            }
+            processBatchGroup(remainingLines, newState, remaining)
+          } else {
+            // No completed futures, wait a bit
+            Thread.sleep(100)
+            processBatchGroup(remainingLines, currentState, batchFutures)
+          }
         }
       }
+
+      processBatchGroup(lines, state, List.empty)
     }
 
     logger.info("Reading and processing CSV file in batches...")
-    val source = Source.fromFile("D:\\iti\\24.FP with Scala\\order-discount-system\\src\\main\\resources\\TRX10M.csv")
+    logger.info(s"Batch size: $batchSize records")
+
+    // OPTIMIZATION 4: Use buffered source with larger buffer
+    val source = Source.fromFile("src/main/resources/TRX10M.csv")(
+      scala.io.Codec.UTF8
+    )
 
     try {
       val lines = source.getLines()
@@ -89,8 +123,7 @@ object orderProcessing extends App {
         Iterator.empty
       }
 
-      val batchSize = 10000 // Adjust based on available memory
-      val finalState = processBatches(dataLines, batchSize, ProcessState(0, 0.0, 0.0, 0.0, 0))
+      val finalState = processBatchesParallel(dataLines, batchSize, ProcessState(0, 0.0, 0.0, 0.0, 0))
 
       // Final summary
       logger.info("=== Summary ===")
@@ -101,11 +134,14 @@ object orderProcessing extends App {
       logger.info(s"Total Rows Inserted: ${finalState.totalInserted}")
 
       val totalDuration = System.currentTimeMillis() - startTime
+      val avgThroughput = finalState.processedCount * 1000 / (totalDuration + 1)
       logger.info(s"TOTAL TIME:       ${totalDuration}ms (${totalDuration / 1000.0}s)")
+      logger.info(s"AVG THROUGHPUT:   $avgThroughput orders/sec")
       logger.info("=== Order Discount System Completed Successfully ===")
 
     } finally {
       source.close()
+      exit(0)
     }
 
   } catch {

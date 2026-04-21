@@ -1,4 +1,4 @@
-import java.sql.{Connection, DriverManager, PreparedStatement}
+import java.sql.{Connection, DriverManager, PreparedStatement, Statement}
 import scala.annotation.tailrec
 
 class OracleWriter(
@@ -11,6 +11,25 @@ class OracleWriter(
   connection.setAutoCommit(false)
   val logger = Logger()
 
+  // Truncate table function - removes all data efficiently
+  def truncateTable(tableName: String = "orders_with_discounts"): Unit = {
+    val truncateSQL = s"TRUNCATE TABLE $tableName"
+
+    try {
+      val stmt = connection.createStatement()
+      stmt.execute(truncateSQL)
+      connection.commit()
+      logger.info(s"Table $tableName truncated successfully")
+    } catch {
+      case e: Exception =>
+        logger.error(s"Error truncating table $tableName: ${e.getMessage}")
+        connection.rollback()
+        throw e
+    } finally {
+      // No need to close Statement explicitly as it will be closed when connection is closed
+    }
+  }
+  
   def createTableIfNotExists(tableName: String = "orders_with_discounts"): Unit = {
     val createTableSQL =
       s"""
@@ -31,23 +50,24 @@ class OracleWriter(
       val stmt = connection.createStatement()
       stmt.execute(createTableSQL)
       connection.commit()
+      logger.info(s"Table $tableName created successfully")
     } catch {
+      case e: Exception if e.getMessage.contains("ORA-00955") =>
+        logger.warn(s"Table $tableName already exists")
       case e: Exception =>
-        if (e.getMessage.contains("ORA-00955")) {
-          logger.warn(s"Table $tableName already exists")
-        } else {
-          logger.error(s"Error creating table: ${e.getMessage}")
-        }
+        logger.error(s"Error creating table: ${e.getMessage}")
+        connection.rollback()
+        throw e
     }
   }
 
-  def insertNewOrdersOnly(orders: List[ProcessedOrder], tableName: String = "orders_with_discounts"): Int = {
+  // Optimized insert - direct insert without checking duplicates (much faster)
+  def insertOrders(orders: List[ProcessedOrder], tableName: String = "orders_with_discounts"): Int = {
     if (orders.isEmpty) {
       logger.warn("No orders to insert")
       return 0
     }
 
-    val checkSQL = s"SELECT COUNT(*) FROM $tableName WHERE timestamp = ?"
     val insertSQL =
       s"""
         INSERT INTO $tableName
@@ -55,54 +75,29 @@ class OracleWriter(
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       """
 
-    val checkStmt = connection.prepareStatement(checkSQL)
     val insertStmt = connection.prepareStatement(insertSQL)
-    val batchSize = 5000
+    val batchSize = 10000 // Larger batch size for better performance
 
     try {
-      // Filter out existing orders first (pure function)
-      val newOrders = orders.filter { processedOrder =>
-        checkStmt.setString(1, processedOrder.order.timestamp)
-        val resultSet = checkStmt.executeQuery()
-        resultSet.next()
-        val exists = resultSet.getInt(1) > 0
-        resultSet.close()
-        !exists
-      }
-
-      val skippedCount = orders.length - newOrders.length
-      if (skippedCount > 0) {
-        logger.info(s"Skipped $skippedCount duplicate rows (already exist in database)")
-      }
-
-      // Insert using tail recursion
       @tailrec
       def insertBatch(remainingOrders: List[ProcessedOrder], currentBatch: List[ProcessedOrder], insertedSoFar: Int): Int = {
         (remainingOrders, currentBatch) match {
-          // No more orders and empty batch - done
           case (Nil, Nil) => insertedSoFar
-
-          // No more orders but batch has items - execute final batch
           case (Nil, batch) =>
-            insertBatchToDatabase(insertStmt, batch)
+            executeBatch(insertStmt, batch)
             connection.commit()
             insertedSoFar + batch.length
-
-          // Batch is full - execute it and continue with next batch
           case (next :: rest, batch) if batch.length + 1 >= batchSize =>
             val newBatch = batch :+ next
-            insertBatchToDatabase(insertStmt, newBatch)
+            executeBatch(insertStmt, newBatch)
             connection.commit()
             insertBatch(rest, List.empty, insertedSoFar + newBatch.length)
-
-          // Add to current batch and continue
           case (next :: rest, batch) =>
             insertBatch(rest, batch :+ next, insertedSoFar)
         }
       }
 
-      // Helper to execute a batch
-      def insertBatchToDatabase(stmt: PreparedStatement, batch: List[ProcessedOrder]): Unit = {
+      def executeBatch(stmt: PreparedStatement, batch: List[ProcessedOrder]): Unit = {
         batch.foreach { order =>
           stmt.setString(1, order.order.timestamp)
           stmt.setString(2, order.order.productName)
@@ -118,7 +113,8 @@ class OracleWriter(
         stmt.executeBatch()
       }
 
-      val insertedCount = insertBatch(newOrders, List.empty, 0)
+      val insertedCount = insertBatch(orders, List.empty, 0)
+      logger.info(s"Successfully inserted $insertedCount orders into $tableName")
       insertedCount
 
     } catch {
@@ -128,15 +124,19 @@ class OracleWriter(
         e.printStackTrace()
         0
     } finally {
-      checkStmt.close()
       insertStmt.close()
     }
   }
 
   def close(): Unit = {
     if (connection != null && !connection.isClosed) {
-      connection.commit()
-      connection.close()
+      try {
+        connection.commit()
+        connection.close()
+        logger.info("Database connection closed")
+      } catch {
+        case e: Exception => logger.error(s"Error closing connection: ${e.getMessage}")
+      }
     }
   }
 }

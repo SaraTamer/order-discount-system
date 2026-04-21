@@ -68,6 +68,12 @@ class RulesBuilder {
       (5 - remainder + o.quantity) / 100
     }
   }
+  private def isVisa(o: Order): Boolean = {
+    o.paymentMethod.toLowerCase == "visa"
+  }
+  private def visaDiscount(o: Order): Double = {
+    0.5
+  }
   def getRules: List[DiscountRule] = {
     val rules = List(
       DiscountRule("Cheese Discount", isCheese, cheeseDiscount),
@@ -75,7 +81,8 @@ class RulesBuilder {
       DiscountRule("Special Date Discount", isSpecialDate, specialDateDiscount),
       DiscountRule("High Quantity Discount", isHighQuantity, highQuantityDiscount),
       DiscountRule("About to Expire Discount", isAboutToExpire, aboutToExpireDiscount),
-      DiscountRule("Sale Through App Discount", isThroughApp, throughAppDiscount)
+      DiscountRule("Sale Through App Discount", isThroughApp, throughAppDiscount),
+      DiscountRule("Visa Payment Discount", isVisa, visaDiscount)
     )
     logger.info(s"Built ${rules.size} discount rules")
     rules

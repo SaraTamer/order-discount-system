@@ -20,7 +20,7 @@ case class OrderProcessor(
     discount
   }
 
-  def calculateFinalPrice(order: Order): Double = {
+  def calculateFinalPrice(order: Order): ProcessedOrder = {
     val discountPercent = calculateAverageOfTopTwoDiscounts(order)
     val originalPrice = order.unitPrice * order.quantity
     val discountAmount = discountPercent * originalPrice
@@ -29,15 +29,7 @@ case class OrderProcessor(
 
     logger.info(s"Order: ${order.productName}, Qty: ${order.quantity}, Original: $$$originalPrice, Discount: $$$discountAmount, Final: $$$finalPriceRounded")
 
-    finalPriceRounded
-  }
-
-  def processOrder(order: Order): ProcessedOrder = {
-    val discountPercentage = calculateAverageOfTopTwoDiscounts(order)
-    val discountAmount =  discountPercentage * order.unitPrice * order.quantity
-    val finalPrice = calculateFinalPrice(order)
-
-    ProcessedOrder(order, discountPercentage, discountAmount, finalPrice)
+    ProcessedOrder(order, discountPercent, discountAmount, finalPrice)
   }
 
 }

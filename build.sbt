@@ -7,5 +7,19 @@ lazy val root = (project in file("."))
     name := "order-discount-system"
   )
 
-libraryDependencies += "com.typesafe" % "config" % "1.4.3"
-libraryDependencies += "com.oracle.database.jdbc" % "ojdbc8" % "23.3.0.23.09"
+libraryDependencies ++= Seq(
+  "org.scala-lang.modules" %% "scala-parallel-collections" % "1.0.4",
+  "com.oracle.database.jdbc" % "ojdbc8" % "23.3.0.23.09",
+  "com.oracle.database.jdbc" % "ucp" % "23.3.0.23.09",  // Connection pool
+  "com.typesafe" % "config" % "1.4.3"
+)
+
+// JVM options for large data processing
+fork := true
+javaOptions ++= Seq(
+  "-Xmx4g",  // Increase heap size to 4GB
+  "-Xms2g",  // Initial heap size
+  "-XX:+UseG1GC",  // Use G1 garbage collector
+  "-XX:MaxGCPauseMillis=100",
+  "-XX:+ParallelRefProcEnabled"
+)

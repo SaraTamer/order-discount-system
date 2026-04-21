@@ -2,7 +2,7 @@ import scala.io.{Codec, Source}
 
 class FileReader {
   private val logger = new Logger()
-
+  
   def readFromPath(filePath: String, codec: String = Codec.default.toString): List[String] = {
     logger.info(s"Reading file from path: $filePath")
     try {

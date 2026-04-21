@@ -62,6 +62,10 @@ class OracleWriter(
     val checkStmt = connection.prepareStatement(checkSQL)
     val insertStmt = connection.prepareStatement(insertSQL)
 
+    // Batch size configuration
+    val batchSize = 5000
+    var currentBatchSize = 0
+
     try {
       orders.foreach { processedOrder =>
         val order = processedOrder.order
@@ -86,17 +90,28 @@ class OracleWriter(
           insertStmt.setDouble(9, processedOrder.finalPrice)
           insertStmt.addBatch()
           insertedCount += 1
+          currentBatchSize += 1
+
+          // Execute batch when it reaches batchSize
+          if (currentBatchSize >= batchSize) {
+            insertStmt.executeBatch()
+            connection.commit()
+            println(s"Batch committed: $insertedCount rows inserted so far")
+            currentBatchSize = 0
+          }
         } else {
           skippedCount += 1
-          println(s"Skipping duplicate order with timestamp: ${order.timestamp}")
         }
       }
 
-      if (insertedCount > 0) {
+      // Execute remaining batch if any
+      if (currentBatchSize > 0) {
         insertStmt.executeBatch()
         connection.commit()
-        println(s"Successfully inserted $insertedCount new rows into $tableName")
+        println(s"Final batch committed: $insertedCount total rows inserted")
       }
+
+      println(s"Successfully inserted $insertedCount new rows into $tableName")
 
       if (skippedCount > 0) {
         println(s"Skipped $skippedCount duplicate rows (already exist in database)")

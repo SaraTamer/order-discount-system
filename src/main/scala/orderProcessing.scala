@@ -21,11 +21,6 @@ object orderProcessing extends App {
     val processedOrders = orders
       .map(orderProcessor.processOrder)
 
-    logger.info("=== Results ===")
-    processedOrders.zipWithIndex.foreach { case (price, idx) =>
-      logger.info(s"Order ${idx + 1}: Final price = $$$price")
-    }
-
     logger.info(s"Total orders processed: ${orders.length}")
     logger.info("=== Order Discount System Completed Successfully ===")
 

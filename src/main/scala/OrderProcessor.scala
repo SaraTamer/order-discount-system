@@ -15,7 +15,7 @@ case class OrderProcessor(
       else applicableDiscounts.take(2).sum / 2.0
     }
     if (applicableDiscounts.nonEmpty) {
-      logger.info(s"Order ${order.productName}: discounts=${applicableDiscounts.mkString(",")} → result=$discount")
+      logger.info(s"Order ${order.timestamp}: discounts=${applicableDiscounts.mkString(",")} → result=$discount")
     }
     discount
   }

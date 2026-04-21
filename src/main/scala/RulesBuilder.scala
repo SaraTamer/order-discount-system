@@ -72,7 +72,7 @@ class RulesBuilder {
     o.paymentMethod.toLowerCase == "visa"
   }
   private def visaDiscount(o: Order): Double = {
-    0.5
+    0.05
   }
   def getRules: List[DiscountRule] = {
     val rules = List(

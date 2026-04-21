@@ -58,13 +58,24 @@ class RulesBuilder {
 
     (30 - daysToExpire) / 100.0
   }
+  private def isThroughApp(o: Order): Boolean = {
+    o.channel.toLowerCase == "app"
+  }
+  private def throughAppDiscount(o: Order): Double = {
+    val remainder = o.quantity % 5
+    if(remainder == 0) o.quantity / 100
+    else {
+      (5 - remainder + o.quantity) / 100
+    }
+  }
   def getRules: List[DiscountRule] = {
     val rules = List(
       DiscountRule("Cheese Discount", isCheese, cheeseDiscount),
       DiscountRule("Wine Discount", isWine, wineDiscount),
       DiscountRule("Special Date Discount", isSpecialDate, specialDateDiscount),
       DiscountRule("High Quantity Discount", isHighQuantity, highQuantityDiscount),
-      DiscountRule("About to Expire Discount", isAboutToExpire, aboutToExpireDiscount)
+      DiscountRule("About to Expire Discount", isAboutToExpire, aboutToExpireDiscount),
+      DiscountRule("Sale Through App Discount", isThroughApp, throughAppDiscount)
     )
     logger.info(s"Built ${rules.size} discount rules")
     rules

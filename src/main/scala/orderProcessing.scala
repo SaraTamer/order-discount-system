@@ -1,4 +1,6 @@
-import scala.collection.parallel.CollectionConverters._
+import scala.annotation.tailrec
+import scala.io.Source
+import scala.collection.parallel.CollectionConverters.*
 
 object orderProcessing extends App {
 
@@ -7,54 +9,104 @@ object orderProcessing extends App {
   logger.info("=== Order Discount System Started ===")
 
   try {
-    logger.info("Reading CSV file...")
-    val lines = FileReader().readFromPath("D:\\iti\\24.FP with Scala\\order-discount-system\\src\\main\\resources\\TRX10M.csv")
-
-    logger.info("Parsing orders...")
-    val orders = OrderParser().parseValidOrders(lines)
-
     logger.info("Building discount rules...")
     val rules = RulesBuilder().getRules
-
-    logger.info("Calculating discounts...")
     val orderProcessor = OrderProcessor(rules)
 
-    logger.info("Processing orders...")
-    val processedOrders: List[ProcessedOrder] =
-      orders
-        .par.map(orderProcessor.calculateFinalPrice).toList
-
-    logger.info(s"Total orders processed: ${processedOrders.length}")
-    logger.info("=== Order Discount System Completed Successfully ===")
-
-    // 6. Write to Oracle database
     logger.info("Connecting to Oracle database...")
     import DatabaseConfig._
     val oracleWriter = new OracleWriter(url, user, password)
-
-    logger.info(s"Creating table $tableName if not exists...")
     oracleWriter.createTableIfNotExists(tableName)
 
-    logger.info(s"Inserting ${processedOrders.length} processed orders into Oracle...")
-    val insertedCount = oracleWriter.insertNewOrdersOnly(processedOrders, tableName)
+    // State as immutable case class
+    case class ProcessState(
+                             processedCount: Int,
+                             totalOriginal: Double,
+                             totalDiscount: Double,
+                             totalFinal: Double,
+                             totalInserted: Int
+                           )
 
-    logger.info(s"Successfully inserted $insertedCount rows into Oracle database")
+    @tailrec
+    def processBatches(
+                        lines: Iterator[String],
+                        batchSize: Int,
+                        state: ProcessState
+                      ): ProcessState = {
+      if (!lines.hasNext) state
+      else {
+        val batchLines = lines.take(batchSize).toList
+        if (batchLines.isEmpty) state
+        else {
+          // Parse batch in parallel
+          val orders = batchLines.par.flatMap { line =>
+            OrderParser().fromCsvLine(line).toOption
+          }.toList
 
-    // 7. Summary
-    val totalOriginal = processedOrders.map(order => order.order.unitPrice * order.order.quantity).sum
-    val totalDiscount = processedOrders.map(_.discountAmount).sum
-    val totalFinal = processedOrders.map(_.finalPrice).sum
+          // Process orders in parallel
+          val processedOrders = orders.par.map(orderProcessor.calculateFinalPrice).toList
 
-    logger.info("=== Summary ===")
-    logger.info(f"Total Original Amount: $$${totalOriginal}%.2f")
-    logger.info(f"Total Discount Amount: $$${totalDiscount}%.2f")
-    logger.info(f"Total Final Amount: $$${totalFinal}%.2f")
+          // Calculate batch summary using parallel aggregation
+          val (batchOriginal, batchDiscount, batchFinal) = processedOrders.par.aggregate((0.0, 0.0, 0.0))(
+            { case ((orig, disc, fin), order) =>
+              (orig + order.order.unitPrice * order.order.quantity, disc + order.discountAmount, fin + order.finalPrice)
+            },
+            { case ((o1, d1, f1), (o2, d2, f2)) =>
+              (o1 + o2, d1 + d2, f1 + f2)
+            }
+          )
 
-    val totalDuration = System.currentTimeMillis() - startTime
-    logger.info(s"TOTAL TIME:       ${totalDuration}ms (${totalDuration / 1000.0}s)")
+          // Insert batch
+          val insertedCount = if (processedOrders.nonEmpty) {
+            oracleWriter.insertNewOrdersOnly(processedOrders, tableName)
+          } else 0
 
-    logger.info("=== Order Discount System Completed Successfully ===")
+          logger.info(s"Processed batch: ${processedOrders.length} orders, Inserted: $insertedCount")
 
+          // Recursively process next batch
+          processBatches(lines, batchSize, ProcessState(
+            processedCount = state.processedCount + processedOrders.length,
+            totalOriginal = state.totalOriginal + batchOriginal,
+            totalDiscount = state.totalDiscount + batchDiscount,
+            totalFinal = state.totalFinal + batchFinal,
+            totalInserted = state.totalInserted + insertedCount
+          ))
+        }
+      }
+    }
+
+    logger.info("Reading and processing CSV file in batches...")
+    val source = Source.fromFile("D:\\iti\\24.FP with Scala\\order-discount-system\\src\\main\\resources\\TRX10M.csv")
+
+    try {
+      val lines = source.getLines()
+
+      // Skip header
+      val dataLines = if (lines.hasNext) {
+        lines.next() // consume header
+        lines
+      } else {
+        Iterator.empty
+      }
+
+      val batchSize = 10000 // Adjust based on available memory
+      val finalState = processBatches(dataLines, batchSize, ProcessState(0, 0.0, 0.0, 0.0, 0))
+
+      // Final summary
+      logger.info("=== Summary ===")
+      logger.info(f"Total Original Amount: $$${finalState.totalOriginal}%.2f")
+      logger.info(f"Total Discount Amount: $$${finalState.totalDiscount}%.2f")
+      logger.info(f"Total Final Amount: $$${finalState.totalFinal}%.2f")
+      logger.info(s"Total Orders Processed: ${finalState.processedCount}")
+      logger.info(s"Total Rows Inserted: ${finalState.totalInserted}")
+
+      val totalDuration = System.currentTimeMillis() - startTime
+      logger.info(s"TOTAL TIME:       ${totalDuration}ms (${totalDuration / 1000.0}s)")
+      logger.info("=== Order Discount System Completed Successfully ===")
+
+    } finally {
+      source.close()
+    }
 
   } catch {
     case e: Exception =>

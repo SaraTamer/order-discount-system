@@ -1,5 +1,5 @@
 import java.sql.{Connection, DriverManager, PreparedStatement}
-import java.time.LocalDate
+import scala.annotation.tailrec
 
 class OracleWriter(
                     url: String,
@@ -9,12 +9,13 @@ class OracleWriter(
 
   private val connection: Connection = DriverManager.getConnection(url, username, password)
   connection.setAutoCommit(false)
+  val logger = Logger()
 
   def createTableIfNotExists(tableName: String = "orders_with_discounts"): Unit = {
     val createTableSQL =
       s"""
         CREATE TABLE $tableName (
-          timestamp VARCHAR2(50) PRIMARY KEY,
+          timestamp VARCHAR2(50),
           product_name VARCHAR2(200),
           expiry_date DATE,
           quantity NUMBER(10),
@@ -30,112 +31,112 @@ class OracleWriter(
       val stmt = connection.createStatement()
       stmt.execute(createTableSQL)
       connection.commit()
-      println(s"Table $tableName created successfully")
     } catch {
       case e: Exception =>
         if (e.getMessage.contains("ORA-00955")) {
-          println(s"Table $tableName already exists")
-        } else if (e.getMessage.contains("ORA-01442")) {
-          println(s"Table $tableName already has PRIMARY KEY constraint")
+          logger.warn(s"Table $tableName already exists")
         } else {
-          println(s"Error creating table: ${e.getMessage}")
+          logger.error(s"Error creating table: ${e.getMessage}")
         }
     }
   }
-  
+
   def insertNewOrdersOnly(orders: List[ProcessedOrder], tableName: String = "orders_with_discounts"): Int = {
     if (orders.isEmpty) {
-      println("No orders to insert")
+      logger.warn("No orders to insert")
       return 0
     }
 
     val checkSQL = s"SELECT COUNT(*) FROM $tableName WHERE timestamp = ?"
     val insertSQL =
       s"""
-        INSERT INTO $tableName 
+        INSERT INTO $tableName
         (timestamp, product_name, expiry_date, quantity, unit_price, channel, payment_method, discount_percentage, final_price)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       """
 
-    var insertedCount = 0
-    var skippedCount = 0
     val checkStmt = connection.prepareStatement(checkSQL)
     val insertStmt = connection.prepareStatement(insertSQL)
-
-    // Batch size configuration
     val batchSize = 5000
-    var currentBatchSize = 0
 
     try {
-      orders.foreach { processedOrder =>
-        val order = processedOrder.order
-
-        // Check if timestamp already exists
-        checkStmt.setString(1, order.timestamp)
+      // Filter out existing orders first (pure function)
+      val newOrders = orders.filter { processedOrder =>
+        checkStmt.setString(1, processedOrder.order.timestamp)
         val resultSet = checkStmt.executeQuery()
         resultSet.next()
         val exists = resultSet.getInt(1) > 0
         resultSet.close()
+        !exists
+      }
 
-        if (!exists) {
-          // Insert new order
-          insertStmt.setString(1, order.timestamp)
-          insertStmt.setString(2, order.productName)
-          insertStmt.setDate(3, java.sql.Date.valueOf(order.expiryDate))
-          insertStmt.setInt(4, order.quantity)
-          insertStmt.setDouble(5, order.unitPrice)
-          insertStmt.setString(6, order.channel)
-          insertStmt.setString(7, order.paymentMethod)
-          insertStmt.setDouble(8, processedOrder.discountPercentage)
-          insertStmt.setDouble(9, processedOrder.finalPrice)
-          insertStmt.addBatch()
-          insertedCount += 1
-          currentBatchSize += 1
+      val skippedCount = orders.length - newOrders.length
+      if (skippedCount > 0) {
+        logger.info(s"Skipped $skippedCount duplicate rows (already exist in database)")
+      }
 
-          // Execute batch when it reaches batchSize
-          if (currentBatchSize >= batchSize) {
-            insertStmt.executeBatch()
+      // Insert using tail recursion
+      @tailrec
+      def insertBatch(remainingOrders: List[ProcessedOrder], currentBatch: List[ProcessedOrder], insertedSoFar: Int): Int = {
+        (remainingOrders, currentBatch) match {
+          // No more orders and empty batch - done
+          case (Nil, Nil) => insertedSoFar
+
+          // No more orders but batch has items - execute final batch
+          case (Nil, batch) =>
+            insertBatchToDatabase(insertStmt, batch)
             connection.commit()
-            println(s"Batch committed: $insertedCount rows inserted so far")
-            currentBatchSize = 0
-          }
-        } else {
-          skippedCount += 1
+            insertedSoFar + batch.length
+
+          // Batch is full - execute it and continue with next batch
+          case (next :: rest, batch) if batch.length + 1 >= batchSize =>
+            val newBatch = batch :+ next
+            insertBatchToDatabase(insertStmt, newBatch)
+            connection.commit()
+            insertBatch(rest, List.empty, insertedSoFar + newBatch.length)
+
+          // Add to current batch and continue
+          case (next :: rest, batch) =>
+            insertBatch(rest, batch :+ next, insertedSoFar)
         }
       }
 
-      // Execute remaining batch if any
-      if (currentBatchSize > 0) {
-        insertStmt.executeBatch()
-        connection.commit()
-        println(s"Final batch committed: $insertedCount total rows inserted")
+      // Helper to execute a batch
+      def insertBatchToDatabase(stmt: PreparedStatement, batch: List[ProcessedOrder]): Unit = {
+        batch.foreach { order =>
+          stmt.setString(1, order.order.timestamp)
+          stmt.setString(2, order.order.productName)
+          stmt.setDate(3, java.sql.Date.valueOf(order.order.expiryDate))
+          stmt.setInt(4, order.order.quantity)
+          stmt.setDouble(5, order.order.unitPrice)
+          stmt.setString(6, order.order.channel)
+          stmt.setString(7, order.order.paymentMethod)
+          stmt.setDouble(8, order.discountPercentage)
+          stmt.setDouble(9, order.finalPrice)
+          stmt.addBatch()
+        }
+        stmt.executeBatch()
       }
 
-      println(s"Successfully inserted $insertedCount new rows into $tableName")
-
-      if (skippedCount > 0) {
-        println(s"Skipped $skippedCount duplicate rows (already exist in database)")
-      }
+      val insertedCount = insertBatch(newOrders, List.empty, 0)
+      insertedCount
 
     } catch {
       case e: Exception =>
         connection.rollback()
-        println(s"Error inserting rows: ${e.getMessage}")
+        logger.error(s"Error inserting rows: ${e.getMessage}")
         e.printStackTrace()
-        insertedCount = 0
+        0
     } finally {
       checkStmt.close()
       insertStmt.close()
     }
-
-    insertedCount
   }
 
   def close(): Unit = {
     if (connection != null && !connection.isClosed) {
       connection.commit()
       connection.close()
-      println("Database connection closed")
     }
   }
 }

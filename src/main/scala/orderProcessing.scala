@@ -1,9 +1,9 @@
 import scala.annotation.tailrec
 import scala.io.Source
 import scala.collection.parallel.CollectionConverters.*
-import java.util.concurrent.Executors
-import scala.concurrent.{Await, ExecutionContext, Future}
-import scala.concurrent.duration.*
+
+import scala.collection.parallel.ForkJoinTaskSupport
+import java.util.concurrent.ForkJoinPool
 import scala.sys.exit
 
 object orderProcessing extends App {
@@ -23,7 +23,6 @@ object orderProcessing extends App {
     oracleWriter.createTableIfNotExists(tableName)
     oracleWriter.truncateTable()
 
-    // State as immutable case class
     case class ProcessState(
                              processedCount: Int,
                              totalOriginal: Double,
@@ -32,116 +31,78 @@ object orderProcessing extends App {
                              totalInserted: Int
                            )
 
-    // Increase batch size for better throughput
-    val batchSize = 50000 // 50K records per batch (adjust based on memory)
-    val parallelismLevel = Runtime.getRuntime.availableProcessors()
-    logger.info(s"Using parallelism level: $parallelismLevel")
+    val batchSize = 50000
+    val coreCount = Runtime.getRuntime.availableProcessors()
+    logger.info(s"Using ForkJoin parallelism: $coreCount")
 
-    // Create a thread pool for parallel batch processing
-    val batchParallelism = Runtime.getRuntime.availableProcessors()
-    implicit val ec: ExecutionContext = ExecutionContext.fromExecutor(
-      Executors.newFixedThreadPool(batchParallelism)
-    )
+    // One dedicated pool — sized to core count, not shared with JVM internals
+    val fjPool       = new ForkJoinPool(coreCount)
+    val taskSupport  = new ForkJoinTaskSupport(fjPool)
 
-    def processBatchesParallel(
-                                lines: Iterator[String],
-                                batchSize: Int,
-                                state: ProcessState
-                              ): ProcessState = {
-      @tailrec
-      def processBatchGroup(
-                             remainingLines: Iterator[String],
-                             currentState: ProcessState,
-                             batchFutures: List[Future[(List[ProcessedOrder], (Double, Double, Double))]]
-                           ): ProcessState = {
-        if (batchFutures.isEmpty && !remainingLines.hasNext) {
-          currentState
-        } else if (batchFutures.size < batchParallelism && remainingLines.hasNext) {
-          // Start new batch
-          val batchLines = remainingLines.take(batchSize).toVector
-          if (batchLines.isEmpty) {
-            processBatchGroup(remainingLines, currentState, batchFutures)
-          } else {
-            // AFTER: plain sequential work inside Future (one thread per Future is enough)
-            val future = Future {
-              val orders = batchLines.iterator.flatMap(OrderParser.fromCsvLine(_).toOption).toList
-              val processed = orders.map(orderProcessor.calculateFinalPrice)
-              val summary = processed.foldLeft((0.0, 0.0, 0.0)) {
-                case ((orig, disc, fin), order) =>
-                  (orig + order.order.unitPrice * order.order.quantity,
-                    disc + order.discountAmount,
-                    fin + order.finalPrice)
-              }
-              (processed, summary)
-            }
-            processBatchGroup(remainingLines, currentState, future :: batchFutures)
-          }
-        } else {
-          // Wait for completed futures
-          val (completed, remaining) = batchFutures.partition(_.isCompleted)
-          if (completed.nonEmpty) {
-            val results = completed.map(Await.result(_, 1.minute))
-            val newState = results.foldLeft(currentState) {
-              case (state, (processed, (orig, disc, fin))) =>
-                val inserted = oracleWriter.insertOrders(processed, tableName)
-                logger.info(s"Processed batch: ${processed.length} orders, Inserted: $inserted")
-                ProcessState(
-                  processedCount = state.processedCount + processed.length,
-                  totalOriginal = state.totalOriginal + orig,
-                  totalDiscount = state.totalDiscount + disc,
-                  totalFinal = state.totalFinal + fin,
-                  totalInserted = state.totalInserted + inserted
-                )
-            }
-            processBatchGroup(remainingLines, newState, remaining)
-          } else {
-            // No completed futures, wait a bit
-            Thread.sleep(100)
-            processBatchGroup(remainingLines, currentState, batchFutures)
-          }
-        }
+    @tailrec
+    def processBatches(lines: Iterator[String], state: ProcessState): ProcessState = {
+      if (!lines.hasNext) return state
+
+      val batchLines = lines.take(batchSize).toVector
+      if (batchLines.isEmpty) return state
+
+      // Attach the dedicated pool — this is the key configuration step
+      val parBatch = batchLines.par
+      parBatch.tasksupport = taskSupport
+
+      // Pure CPU work runs in parallel across all cores
+      val processed = parBatch
+        .flatMap(OrderParser.fromCsvLine(_).toOption)
+        .map(orderProcessor.calculateFinalPrice)
+        .toList
+
+      val summary = processed.foldLeft((0.0, 0.0, 0.0)) {
+        case ((orig, disc, fin), order) =>
+          (orig + order.order.unitPrice * order.order.quantity,
+            disc + order.discountAmount,
+            fin + order.finalPrice)
       }
 
-      processBatchGroup(lines, state, List.empty)
+      // DB write stays on the main thread — single connection, must be sequential
+      val inserted = oracleWriter.insertOrders(processed, tableName)
+      logger.info(s"Batch done: ${processed.length} processed, $inserted inserted")
+
+      processBatches(lines, ProcessState(
+        processedCount = state.processedCount + processed.length,
+        totalOriginal  = state.totalOriginal  + summary._1,
+        totalDiscount  = state.totalDiscount  + summary._2,
+        totalFinal     = state.totalFinal     + summary._3,
+        totalInserted  = state.totalInserted  + inserted
+      ))
     }
 
     logger.info("Reading and processing CSV file in batches...")
     logger.info(s"Batch size: $batchSize records")
 
-    // OPTIMIZATION 4: Use buffered source with larger buffer
-    val source = Source.fromFile("src/main/resources/TRX10M.csv")(
-      scala.io.Codec.UTF8
-    )
+    val source = Source.fromFile("src/main/resources/TRX10M.csv")(scala.io.Codec.UTF8)
 
     try {
       val lines = source.getLines()
+      if (lines.hasNext) lines.next() // skip header
 
-      // Skip header
-      val dataLines = if (lines.hasNext) {
-        lines.next() // consume header
-        lines
-      } else {
-        Iterator.empty
-      }
+      val finalState = processBatches(lines, ProcessState(0, 0.0, 0.0, 0.0, 0))
 
-      val finalState = processBatchesParallel(dataLines, batchSize, ProcessState(0, 0.0, 0.0, 0.0, 0))
-
-      // Final summary
       logger.info("=== Summary ===")
       logger.info(f"Total Original Amount: $$${finalState.totalOriginal}%.2f")
       logger.info(f"Total Discount Amount: $$${finalState.totalDiscount}%.2f")
-      logger.info(f"Total Final Amount: $$${finalState.totalFinal}%.2f")
+      logger.info(f"Total Final Amount:    $$${finalState.totalFinal}%.2f")
       logger.info(s"Total Orders Processed: ${finalState.processedCount}")
-      logger.info(s"Total Rows Inserted: ${finalState.totalInserted}")
+      logger.info(s"Total Rows Inserted:    ${finalState.totalInserted}")
 
       val totalDuration = System.currentTimeMillis() - startTime
       val avgThroughput = finalState.processedCount * 1000 / (totalDuration + 1)
-      logger.info(s"TOTAL TIME:       ${totalDuration}ms (${totalDuration / 1000.0}s)")
-      logger.info(s"AVG THROUGHPUT:   $avgThroughput orders/sec")
+      logger.info(s"TOTAL TIME:     ${totalDuration}ms (${totalDuration / 1000.0}s)")
+      logger.info(s"AVG THROUGHPUT: $avgThroughput orders/sec")
       logger.info("=== Order Discount System Completed Successfully ===")
 
     } finally {
       source.close()
+      fjPool.shutdown()
       exit(0)
     }
 

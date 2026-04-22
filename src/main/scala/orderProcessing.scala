@@ -79,7 +79,7 @@ object orderProcessing extends App {
     logger.info("Reading and processing CSV file in batches...")
     logger.info(s"Batch size: $batchSize records")
 
-    val source = Source.fromFile("src/main/resources/TRX10M.csv")(scala.io.Codec.UTF8)
+    val source = Source.fromFile("src/main/resources/TRX1000.csv")(scala.io.Codec.UTF8)
 
     try {
       val lines = source.getLines()

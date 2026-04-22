@@ -6,7 +6,7 @@ import scala.collection.parallel.ForkJoinTaskSupport
 import java.util.concurrent.ForkJoinPool
 import scala.sys.exit
 
-object orderProcessing extends App {
+object OrderProcessing extends App {
 
   val logger = new Logger()
   val startTime = System.currentTimeMillis()

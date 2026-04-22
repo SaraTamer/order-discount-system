@@ -3,6 +3,7 @@ case class OrderProcessor(
                               ){
   private val logger = new Logger()
 
+  // Business rule: use the average of the top two applicable discounts.
   def calculateAverageOfTopTwoDiscounts(order: Order): Double = {
     val applicableDiscounts = this.rules
       .filter(_.isQualified(order)) // Keep only rules that apply
@@ -17,6 +18,7 @@ case class OrderProcessor(
     discount
   }
 
+  // Calculates monetary values after discount and returns a rich result object.
   def calculateFinalPrice(order: Order): ProcessedOrder = {
     val discountPercent = calculateAverageOfTopTwoDiscounts(order)
     val originalPrice = order.unitPrice * order.quantity

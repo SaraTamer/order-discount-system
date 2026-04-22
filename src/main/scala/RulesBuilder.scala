@@ -12,6 +12,7 @@ class RulesBuilder {
 
   private val logger = Logger()
 
+  // Product-name based rules.
   private def isCheese(o: Order): Boolean = {
     val pattern = "^cheese.*".r
     pattern.matches(o.productName.toLowerCase)
@@ -26,6 +27,7 @@ class RulesBuilder {
   private def wineDiscount(o: Order): Double = {
     0.05
   }
+  // Calendar-driven promotional rule.
   private def isSpecialDate(o: Order): Boolean ={
     val month = o.timestamp.slice(5, 7)
     val day = o.timestamp.slice(8, 10)
@@ -43,6 +45,7 @@ class RulesBuilder {
     else if(o.quantity <= 14) 0.07
     else 0.1
   }
+  // Expiry rule compares order date with product expiry date.
   private def isAboutToExpire(o: Order): Boolean = {
     val orderDateString = o.timestamp.split('T')(0)
     val orderDate = LocalDate.parse(orderDateString, DateTimeFormatter.ofPattern("yyyy-MM-dd"))
@@ -74,6 +77,7 @@ class RulesBuilder {
   private def visaDiscount(o: Order): Double = {
     0.05
   }
+  // Central registry of all active discount rules.
   def getRules: List[DiscountRule] = {
     val rules = List(
       DiscountRule("Cheese Discount", isCheese, cheeseDiscount),

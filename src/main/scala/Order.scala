@@ -1,5 +1,6 @@
 import java.time.LocalDate
 
+// Raw order record parsed from CSV input.
 case class Order(
                   timestamp: String,
                   productName: String,
@@ -10,6 +11,7 @@ case class Order(
                   paymentMethod: String
                 )
 
+// Enriched order including computed discount and final totals.
 case class ProcessedOrder(
                            order: Order,
                            discountPercentage: Double,

@@ -7,6 +7,7 @@ class OracleWriter(
                     password: String
                   ) {
 
+  // Keep one shared transactional connection for bulk insert performance.
   private val connection: Connection = DriverManager.getConnection(url, username, password)
   connection.setAutoCommit(false)
   val logger = Logger()
@@ -79,6 +80,7 @@ class OracleWriter(
     val batchSize = 10000 // Larger batch size for better performance
 
     try {
+      // Tail-recursive batching avoids stack growth on very large datasets.
       @tailrec
       def insertBatch(remainingOrders: List[ProcessedOrder], currentBatch: List[ProcessedOrder], insertedSoFar: Int): Int = {
         (remainingOrders, currentBatch) match {
@@ -97,6 +99,7 @@ class OracleWriter(
         }
       }
 
+      // Binds order fields to JDBC parameters and sends a single DB batch.
       def executeBatch(stmt: PreparedStatement, batch: List[ProcessedOrder]): Unit = {
         batch.foreach { order =>
           stmt.setString(1, order.order.timestamp)

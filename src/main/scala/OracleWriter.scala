@@ -93,7 +93,7 @@ class OracleWriter(
             connection.commit()
             insertBatch(rest, List.empty, insertedSoFar + newBatch.length)
           case (next :: rest, batch) =>
-            insertBatch(rest, batch :+ next, insertedSoFar)
+            insertBatch(rest, next :: batch, insertedSoFar)
         }
       }
 

@@ -38,7 +38,7 @@ object orderProcessing extends App {
     logger.info(s"Using parallelism level: $parallelismLevel")
 
     // Create a thread pool for parallel batch processing
-    val batchParallelism = 4 // Process 4 batches concurrently
+    val batchParallelism = Runtime.getRuntime.availableProcessors()
     implicit val ec: ExecutionContext = ExecutionContext.fromExecutor(
       Executors.newFixedThreadPool(batchParallelism)
     )
@@ -62,9 +62,10 @@ object orderProcessing extends App {
           if (batchLines.isEmpty) {
             processBatchGroup(remainingLines, currentState, batchFutures)
           } else {
+            // AFTER: plain sequential work inside Future (one thread per Future is enough)
             val future = Future {
-              val orders = batchLines.par.flatMap(OrderParser.fromCsvLine(_).toOption).toList
-              val processed = orders.par.map(orderProcessor.calculateFinalPrice).toList
+              val orders = batchLines.iterator.flatMap(OrderParser.fromCsvLine(_).toOption).toList
+              val processed = orders.map(orderProcessor.calculateFinalPrice)
               val summary = processed.foldLeft((0.0, 0.0, 0.0)) {
                 case ((orig, disc, fin), order) =>
                   (orig + order.order.unitPrice * order.order.quantity,
